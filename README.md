@@ -46,6 +46,12 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+## Contributing
+
+The project is an MVP and welcomes focused improvements. See [CONTRIBUTING.md](CONTRIBUTING.md) for the review workflow and [ROADMAP.md](ROADMAP.md) for proposed work. Please open or discuss an issue before starting a substantial change.
+
+Security concerns should follow [SECURITY.md](SECURITY.md). Community participation follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
