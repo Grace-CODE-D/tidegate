@@ -19,6 +19,8 @@ use std::{
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+mod validation;
+
 #[derive(Clone)]
 struct AppState {
     cache: Arc<Mutex<CacheStore>>,
@@ -229,6 +231,7 @@ async fn read_cache(
     State(state): State<AppState>,
     Query(query): Query<CacheQuery>,
 ) -> Result<Json<CacheEntry>, (StatusCode, Json<Value>)> {
+    validation::validate_cache_key(&query.key).map_err(invalid_key_response)?;
     state.metrics.lock().expect("metrics lock").cache_reads += 1;
     let cache = state.cache.lock().expect("cache lock");
     let value = cache.get(&query.key).cloned().ok_or_else(|| {
@@ -244,29 +247,51 @@ async fn write_cache(
     State(state): State<AppState>,
     Path(key): Path<String>,
     Json(entry): Json<CacheEntry>,
-) -> (StatusCode, Json<CacheEntry>) {
+) -> Result<(StatusCode, Json<CacheEntry>), (StatusCode, Json<Value>)> {
+    validation::validate_cache_key(&key).map_err(invalid_key_response)?;
     state.metrics.lock().expect("metrics lock").cache_writes += 1;
     state
         .cache
         .lock()
         .expect("cache lock")
         .insert(key, entry.value.clone());
-    (StatusCode::CREATED, Json(entry))
+    Ok((StatusCode::CREATED, Json(entry)))
 }
 
-async fn delete_cache(State(state): State<AppState>, Path(key): Path<String>) -> StatusCode {
+async fn delete_cache(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    validation::validate_cache_key(&key).map_err(invalid_key_response)?;
     state.metrics.lock().expect("metrics lock").cache_deletes += 1;
-    if state
-        .cache
-        .lock()
-        .expect("cache lock")
-        .remove(&key)
-        .is_some()
-    {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
-    }
+    Ok(
+        if state
+            .cache
+            .lock()
+            .expect("cache lock")
+            .remove(&key)
+            .is_some()
+        {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::NOT_FOUND
+        },
+    )
+}
+
+fn invalid_key_response(error: validation::CacheKeyError) -> (StatusCode, Json<Value>) {
+    let message = match error {
+        validation::CacheKeyError::Empty => "cache key must not be empty",
+        validation::CacheKeyError::TooLong => "cache key exceeds 128 characters",
+        validation::CacheKeyError::ContainsPathSeparator => {
+            "cache key must not contain path separators"
+        }
+        validation::CacheKeyError::ContainsControlCharacter => {
+            "cache key must not contain control characters"
+        }
+        validation::CacheKeyError::ContainsWhitespace => "cache key must not contain whitespace",
+    };
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": message })))
 }
 
 #[cfg(test)]
@@ -357,5 +382,18 @@ mod tests {
             body,
             r#"{"total_requests":3,"rejected_requests":0,"cache_reads":1,"cache_writes":1,"cache_deletes":0}"#
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_cache_keys_return_bad_request() {
+        let request = Request::builder()
+            .uri("/v1/cache?key=bad%20key")
+            .body(Body::empty())
+            .unwrap();
+        let response = app(test_state(2)).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, r#"{"error":"cache key must not contain whitespace"}"#);
     }
 }

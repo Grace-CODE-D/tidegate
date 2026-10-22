@@ -26,11 +26,11 @@ The service is intentionally focused. It does not pretend to be a durable databa
 | --- | --- | --- |
 | `GET` | `/healthz` | Returns service status, current cache entries, and configured capacity. |
 | `GET` | `/metrics` | Returns request and cache operation counters as JSON. |
-| `GET` | `/v1/cache?key=name` | Reads a cached JSON value. Returns `404` if the key is absent. |
-| `PUT` | `/v1/cache/:key` | Stores a JSON value and returns `201 Created`. |
-| `DELETE` | `/v1/cache/:key` | Removes a value and returns `204` or `404`. |
+| `GET` | `/v1/cache?key=name` | Reads a cached JSON value. Returns `404` if the key is absent and `400` if the key is invalid. |
+| `PUT` | `/v1/cache/:key` | Stores a JSON value and returns `201 Created`; invalid keys return `400`. |
+| `DELETE` | `/v1/cache/:key` | Removes a value and returns `204`, `404`, or `400` for an invalid key. |
 
-The cache uses a bounded recency queue. When it reaches capacity, the oldest untouched entry is removed. Updating an existing key refreshes its position. Cache values disappear when the process stops.
+Cache keys must be non-empty, no more than 128 Unicode characters, and must not contain whitespace, control characters, or path separators. The cache uses a bounded recency queue. When it reaches capacity, the oldest untouched entry is removed. Updating an existing key refreshes its position. Cache values disappear when the process stops.
 
 ## Quick start
 
@@ -88,6 +88,7 @@ The rate limiter uses the first address in `X-Forwarded-For` when present and ot
 The current MVP keeps the implementation deliberately small:
 
 - `src/main.rs` contains the Axum router, middleware, handlers, bounded cache, metrics, and tests.
+- `src/validation.rs` contains reusable cache-key validation rules and focused unit tests.
 - `.github/workflows/ci.yml` runs formatting, tests, and Clippy.
 - `.github/workflows/security.yml` runs RustSec dependency auditing and the blocked-CDN asset scan.
 - `scripts/security-scan.sh` rejects tracked runtime/configuration files that reference `polyfill.io` or `cdn.polyfill.io`.
