@@ -23,6 +23,7 @@ use tracing::info;
 struct AppState {
     cache: Arc<Mutex<CacheStore>>,
     limits: Arc<Mutex<HashMap<String, Window>>>,
+    metrics: Arc<Mutex<Metrics>>,
     config: Config,
 }
 
@@ -61,6 +62,15 @@ struct HealthResponse {
     cache_capacity: usize,
 }
 
+#[derive(Clone, Default, Serialize)]
+struct Metrics {
+    total_requests: u64,
+    rejected_requests: u64,
+    cache_reads: u64,
+    cache_writes: u64,
+    cache_deletes: u64,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -83,6 +93,7 @@ fn app(state: AppState) -> Router {
     let rate_state = state.clone();
     Router::new()
         .route("/healthz", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/cache", get(read_cache))
         .route("/v1/cache/:key", put(write_cache).delete(delete_cache))
         .with_state(state)
@@ -109,6 +120,7 @@ impl AppState {
         Self {
             cache: Arc::new(Mutex::new(CacheStore::new(cache_capacity))),
             limits: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(Mutex::new(Metrics::default())),
             config: Config {
                 max_requests,
                 window: Duration::from_secs(window_seconds),
@@ -156,6 +168,7 @@ impl CacheStore {
 }
 
 async fn rate_limit(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
+    state.metrics.lock().expect("metrics lock").total_requests += 1;
     let client = request
         .headers()
         .get("x-forwarded-for")
@@ -183,6 +196,11 @@ async fn rate_limit(State(state): State<AppState>, request: Request<Body>, next:
     };
 
     if !allowed {
+        state
+            .metrics
+            .lock()
+            .expect("metrics lock")
+            .rejected_requests += 1;
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", state.config.window.as_secs().to_string())],
@@ -203,10 +221,15 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+async fn metrics(State(state): State<AppState>) -> Json<Metrics> {
+    Json(state.metrics.lock().expect("metrics lock").clone())
+}
+
 async fn read_cache(
     State(state): State<AppState>,
     Query(query): Query<CacheQuery>,
 ) -> Result<Json<CacheEntry>, (StatusCode, Json<Value>)> {
+    state.metrics.lock().expect("metrics lock").cache_reads += 1;
     let cache = state.cache.lock().expect("cache lock");
     let value = cache.get(&query.key).cloned().ok_or_else(|| {
         (
@@ -222,6 +245,7 @@ async fn write_cache(
     Path(key): Path<String>,
     Json(entry): Json<CacheEntry>,
 ) -> (StatusCode, Json<CacheEntry>) {
+    state.metrics.lock().expect("metrics lock").cache_writes += 1;
     state
         .cache
         .lock()
@@ -231,6 +255,7 @@ async fn write_cache(
 }
 
 async fn delete_cache(State(state): State<AppState>, Path(key): Path<String>) -> StatusCode {
+    state.metrics.lock().expect("metrics lock").cache_deletes += 1;
     if state
         .cache
         .lock()
@@ -254,6 +279,7 @@ mod tests {
         AppState {
             cache: Arc::new(Mutex::new(CacheStore::new(capacity))),
             limits: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(Mutex::new(Metrics::default())),
             config: Config {
                 max_requests: 60,
                 window: Duration::from_secs(60),
@@ -316,9 +342,20 @@ mod tests {
             .uri("/v1/cache?key=demo")
             .body(Body::empty())
             .unwrap();
-        let response = app.oneshot(request).await.unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, r#"{"value":{"message":"hello"}}"#);
+
+        let request = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            body,
+            r#"{"total_requests":3,"rejected_requests":0,"cache_reads":1,"cache_writes":1,"cache_deletes":0}"#
+        );
     }
 }
