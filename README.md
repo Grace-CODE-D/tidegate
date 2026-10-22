@@ -53,6 +53,8 @@ The project is an MVP and welcomes focused improvements. See [CONTRIBUTING.md](C
 
 Security concerns should follow [SECURITY.md](SECURITY.md). Community participation follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
+Every push and pull request also runs the security workflow. It audits Rust dependencies against RustSec and blocks tracked web/configuration files that reference the compromised `polyfill.io` CDN. These checks reduce supply-chain risk but are not a guarantee that arbitrary malware or every vulnerability will be detected.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
