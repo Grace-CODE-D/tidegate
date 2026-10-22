@@ -1,4 +1,5 @@
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
     http::{Request, StatusCode},
     middleware::{self, Next},
@@ -9,7 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -20,7 +21,7 @@ use tracing::info;
 
 #[derive(Clone)]
 struct AppState {
-    cache: Arc<Mutex<HashMap<String, Value>>>,
+    cache: Arc<Mutex<CacheStore>>,
     limits: Arc<Mutex<HashMap<String, Window>>>,
     config: Config,
 }
@@ -37,6 +38,12 @@ struct Window {
     requests: u32,
 }
 
+struct CacheStore {
+    entries: HashMap<String, Value>,
+    insertion_order: VecDeque<String>,
+    capacity: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct CacheQuery {
     key: String,
@@ -51,6 +58,7 @@ struct CacheEntry {
 struct HealthResponse {
     status: &'static str,
     cached_entries: usize,
+    cache_capacity: usize,
 }
 
 #[tokio::main]
@@ -92,9 +100,14 @@ impl AppState {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(60);
+        let cache_capacity = env::var("TIDEGATE_CACHE_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(256);
 
         Self {
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(CacheStore::new(cache_capacity))),
             limits: Arc::new(Mutex::new(HashMap::new())),
             config: Config {
                 max_requests,
@@ -104,11 +117,45 @@ impl AppState {
     }
 }
 
-async fn rate_limit(
-    State(state): State<AppState>,
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+impl CacheStore {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "cache capacity must be greater than zero");
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&Value> {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: String, value: Value) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key.clone(), value);
+            self.insertion_order.retain(|entry| entry != &key);
+            self.insertion_order.push_back(key);
+            return;
+        }
+
+        if self.entries.len() == self.capacity {
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.insertion_order.push_back(key.clone());
+        self.entries.insert(key, value);
+    }
+
+    fn remove(&mut self, key: &str) -> Option<Value> {
+        let value = self.entries.remove(key)?;
+        self.insertion_order.retain(|entry| entry != key);
+        Some(value)
+    }
+}
+
+async fn rate_limit(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
     let client = request
         .headers()
         .get("x-forwarded-for")
@@ -148,10 +195,11 @@ async fn rate_limit(
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    let cached_entries = state.cache.lock().expect("cache lock").len();
+    let cache = state.cache.lock().expect("cache lock");
     Json(HealthResponse {
         status: "ok",
-        cached_entries,
+        cached_entries: cache.entries.len(),
+        cache_capacity: cache.capacity,
     })
 }
 
@@ -159,18 +207,13 @@ async fn read_cache(
     State(state): State<AppState>,
     Query(query): Query<CacheQuery>,
 ) -> Result<Json<CacheEntry>, (StatusCode, Json<Value>)> {
-    let value = state
-        .cache
-        .lock()
-        .expect("cache lock")
-        .get(&query.key)
-        .cloned()
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "cache key not found" })),
-            )
-        })?;
+    let cache = state.cache.lock().expect("cache lock");
+    let value = cache.get(&query.key).cloned().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "cache key not found" })),
+        )
+    })?;
     Ok(Json(CacheEntry { value }))
 }
 
@@ -204,19 +247,49 @@ async fn delete_cache(State(state): State<AppState>, Path(key): Path<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
+    use tower::ServiceExt;
+
+    fn test_state(capacity: usize) -> AppState {
+        AppState {
+            cache: Arc::new(Mutex::new(CacheStore::new(capacity))),
+            limits: Arc::new(Mutex::new(HashMap::new())),
+            config: Config {
+                max_requests: 60,
+                window: Duration::from_secs(60),
+            },
+        }
+    }
 
     #[test]
     fn cache_round_trip_is_json_safe() {
-        let state = AppState::from_env();
-        state
-            .cache
-            .lock()
-            .unwrap()
-            .insert("demo".into(), json!({"enabled": true}));
-        assert_eq!(
-            state.cache.lock().unwrap().get("demo"),
-            Some(&json!({"enabled": true}))
-        );
+        let mut cache = CacheStore::new(2);
+        cache.insert("demo".into(), json!({"enabled": true}));
+        assert_eq!(cache.get("demo"), Some(&json!({"enabled": true})));
+    }
+
+    #[test]
+    fn cache_evicts_the_oldest_entry_at_capacity() {
+        let mut cache = CacheStore::new(2);
+        cache.insert("first".into(), json!(1));
+        cache.insert("second".into(), json!(2));
+        cache.insert("third".into(), json!(3));
+
+        assert!(cache.get("first").is_none());
+        assert_eq!(cache.get("second"), Some(&json!(2)));
+        assert_eq!(cache.get("third"), Some(&json!(3)));
+    }
+
+    #[test]
+    fn updating_a_key_does_not_consume_capacity() {
+        let mut cache = CacheStore::new(2);
+        cache.insert("first".into(), json!(1));
+        cache.insert("second".into(), json!(2));
+        cache.insert("first".into(), json!(10));
+        cache.insert("third".into(), json!(3));
+
+        assert_eq!(cache.get("first"), Some(&json!(10)));
+        assert!(cache.get("second").is_none());
     }
 
     #[test]
@@ -224,5 +297,28 @@ mod tests {
         let state = AppState::from_env();
         assert_eq!(state.config.max_requests, 60);
         assert_eq!(state.config.window, Duration::from_secs(60));
+        assert_eq!(state.cache.lock().unwrap().capacity, 256);
+    }
+
+    #[tokio::test]
+    async fn cache_routes_work_end_to_end() {
+        let app = app(test_state(2));
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/v1/cache/demo")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"value":{"message":"hello"}}"#))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let request = Request::builder()
+            .uri("/v1/cache?key=demo")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, r#"{"value":{"message":"hello"}}"#);
     }
 }

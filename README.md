@@ -6,14 +6,14 @@ This is an independent clean-room implementation. It is not affiliated with Lume
 
 ## Features
 
-- `GET /healthz` reports service health and the number of cached entries.
+- `GET /healthz` reports service health, current cache usage, and cache capacity.
 - `PUT /v1/cache/:key` stores a JSON value in memory.
 - `GET /v1/cache?key=...` reads a JSON value.
 - `DELETE /v1/cache/:key` removes a value.
 - Requests are rate-limited per `X-Forwarded-For` address, falling back to a local client bucket.
 - Configuration is provided through environment variables.
 
-The cache is intentionally ephemeral and process-local. Use a durable store and a trusted proxy configuration before using this as a production service.
+The cache is intentionally ephemeral and process-local. It has a configurable bounded recency queue: the oldest untouched entry is evicted when capacity is reached, while updating an entry refreshes its position. Use a durable store and a trusted proxy configuration before using this as a production service.
 
 ## Run
 
@@ -26,6 +26,7 @@ The server listens on `127.0.0.1:8080` by default. Configure it with:
 - `TIDEGATE_ADDR`, for example `0.0.0.0:8080`
 - `TIDEGATE_RATE_LIMIT`, requests allowed per window, default `60`
 - `TIDEGATE_RATE_WINDOW_SECONDS`, window length, default `60`
+- `TIDEGATE_CACHE_CAPACITY`, maximum cached entries, default `256`
 - `RUST_LOG`, for example `tidegate=debug`
 
 Example:
