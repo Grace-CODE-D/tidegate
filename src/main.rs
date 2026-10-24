@@ -19,6 +19,7 @@ use std::{
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+mod stellar;
 mod validation;
 
 #[derive(Clone)]
@@ -26,6 +27,7 @@ struct AppState {
     cache: Arc<Mutex<CacheStore>>,
     limits: Arc<Mutex<HashMap<String, Window>>>,
     metrics: Arc<Mutex<Metrics>>,
+    stellar_rpc: Option<stellar::StellarRpcClient>,
     config: Config,
 }
 
@@ -71,6 +73,8 @@ struct Metrics {
     cache_reads: u64,
     cache_writes: u64,
     cache_deletes: u64,
+    stellar_rpc_requests: u64,
+    stellar_rpc_errors: u64,
 }
 
 #[tokio::main]
@@ -96,6 +100,7 @@ fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/metrics", get(metrics))
+        .route("/v1/stellar/ledger/latest", get(latest_stellar_ledger))
         .route("/v1/cache", get(read_cache))
         .route("/v1/cache/:key", put(write_cache).delete(delete_cache))
         .with_state(state)
@@ -118,11 +123,16 @@ impl AppState {
             .and_then(|value| value.parse().ok())
             .filter(|value| *value > 0)
             .unwrap_or(256);
+        let stellar_rpc = env::var("STELLAR_RPC_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(stellar::StellarRpcClient::new);
 
         Self {
             cache: Arc::new(Mutex::new(CacheStore::new(cache_capacity))),
             limits: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Mutex::new(Metrics::default())),
+            stellar_rpc,
             config: Config {
                 max_requests,
                 window: Duration::from_secs(window_seconds),
@@ -227,6 +237,35 @@ async fn metrics(State(state): State<AppState>) -> Json<Metrics> {
     Json(state.metrics.lock().expect("metrics lock").clone())
 }
 
+async fn latest_stellar_ledger(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let client = state.stellar_rpc.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "STELLAR_RPC_URL is not configured"
+            })),
+        )
+    })?;
+    state
+        .metrics
+        .lock()
+        .expect("metrics lock")
+        .stellar_rpc_requests += 1;
+    match client.latest_ledger().await {
+        Ok(result) => Ok(Json(result)),
+        Err(error) => {
+            state
+                .metrics
+                .lock()
+                .expect("metrics lock")
+                .stellar_rpc_errors += 1;
+            Err((StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))))
+        }
+    }
+}
+
 async fn read_cache(
     State(state): State<AppState>,
     Query(query): Query<CacheQuery>,
@@ -305,6 +344,7 @@ mod tests {
             cache: Arc::new(Mutex::new(CacheStore::new(capacity))),
             limits: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Mutex::new(Metrics::default())),
+            stellar_rpc: None,
             config: Config {
                 max_requests: 60,
                 window: Duration::from_secs(60),
@@ -380,7 +420,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
             body,
-            r#"{"total_requests":3,"rejected_requests":0,"cache_reads":1,"cache_writes":1,"cache_deletes":0}"#
+            r#"{"total_requests":3,"rejected_requests":0,"cache_reads":1,"cache_writes":1,"cache_deletes":0,"stellar_rpc_requests":0,"stellar_rpc_errors":0}"#
         );
     }
 
@@ -395,5 +435,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, r#"{"error":"cache key must not contain whitespace"}"#);
+    }
+
+    #[tokio::test]
+    async fn stellar_route_requires_rpc_configuration() {
+        let request = Request::builder()
+            .uri("/v1/stellar/ledger/latest")
+            .body(Body::empty())
+            .unwrap();
+        let response = app(test_state(2)).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

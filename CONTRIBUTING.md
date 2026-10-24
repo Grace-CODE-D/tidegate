@@ -9,7 +9,7 @@ Please open or comment on an issue before beginning a non-trivial change. Explai
 ## Development workflow
 
 1. Fork the repository and create a focused branch.
-2. Run `cargo fmt`, `cargo test`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+2. Run `cargo fmt`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 3. Add or update tests for behavior changes.
 4. Open a pull request that describes the problem, the solution, and any trade-offs.
 5. Link the pull request to its issue with a keyword such as `Closes #123`.
@@ -18,4 +18,4 @@ Please do not include secrets, generated build artifacts, or unrelated formattin
 
 ## Review expectations
 
-Contributions should keep the public API understandable, preserve safe defaults, and document operational limitations. Maintainers may request changes before merging. Be constructive and patient during review.
+Contributions should keep the public API understandable, preserve safe defaults, document operational limitations, and keep the contract and gateway boundaries clear. Contract changes must include Soroban tests and must not introduce private-key custody into the gateway. Maintainers may request changes before merging. Be constructive and patient during review.

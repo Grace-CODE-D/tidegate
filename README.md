@@ -1,122 +1,158 @@
 # Tidegate
 
-Tidegate is a compact Rust edge gateway for small services that need a dependable HTTP boundary without immediately adopting a database or a large platform. It combines a bounded JSON cache, a simple per-client rate limiter, health reporting, request metrics, and a security-focused CI pipeline in one small service that is easy to run locally and easy to extend.
+Tidegate is a Stellar-focused Rust project with two connected parts:
 
-Tidegate is an independent clean-room implementation. It is not affiliated with Lumen-Scribe, Lumenqraph, Drips, or any other project. It follows common gateway design patterns without copying another repository's source code, documentation, branding, or history.
+1. A Soroban `gateway-registry` contract for publishing and managing gateway operators on Stellar.
+2. A read-only HTTP gateway that connects to Stellar RPC, applies rate limits, validates inputs, exposes metrics, and provides bounded local caching for service data.
 
-## What it does
+The project is designed to give Stellar developers a small, understandable starting point for operating network-aware services. It does not hold private keys, sign transactions, or claim to be a replacement for Stellar RPC, Horizon, or a full indexer. The gateway is an application-layer companion to Stellar infrastructure; the registry contract is the on-chain component.
 
-A request enters through the Axum router and passes through the rate-limit middleware. Accepted requests reach one of the health, metrics, or cache handlers. Cache state is held in a bounded process-local store, while counters are exposed through a small JSON metrics endpoint.
+Tidegate is an independent implementation. It is not affiliated with Lumen-Scribe, Lumenqraph, Drips, or any other project.
+
+## Why Stellar is part of the design
+
+The gateway is built around the current Stellar application stack. Stellar RPC is used for live network and smart-contract access. The Soroban contract is written in Rust with `soroban-sdk`. The gateway's existing cache, rate limiter, request metrics, and security checks support the operational side of interacting with Stellar services.
+
+The project follows Stellar's current direction toward Stellar RPC for new application work. Horizon remains useful for existing integrations, but Stellar's documentation describes it as nearing end-of-life for new feature development. Tidegate therefore does not introduce a new Horizon dependency.
+
+Relevant official resources:
+
+- [Stellar Stack](https://developers.stellar.org/docs/learn/fundamentals/stellar-stack)
+- [Stellar RPC](https://developers.stellar.org/docs/data/apis/rpc)
+- [Stellar client SDKs](https://developers.stellar.org/docs/tools/sdks/client-sdks)
+- [Soroban contract development](https://developers.stellar.org/docs/build/smart-contracts/getting-started/hello-world)
+- [Stellar ecosystem resources](https://github.com/stellar/ecosystem-resources)
+
+## Soroban gateway registry
+
+The `contracts/gateway-registry` package contains the on-chain registry. An operator account can register a gateway endpoint and software version, update its metadata, deactivate the registration, or let another application read the current record.
+
+The contract exposes these functions:
+
+- `register(operator, endpoint, version)` creates an active record. The operator must authorize the call.
+- `update(operator, endpoint, version)` changes an existing record and reactivates it. The operator must authorize the call.
+- `deactivate(operator)` marks an existing record inactive. The operator must authorize the call.
+- `get(operator)` returns the current record, if one exists.
+
+Each record contains the operator address, endpoint string, version string, and active flag. Endpoint and version lengths are bounded on-chain. The contract does not fetch URLs, sign transactions, custody funds, or make off-chain trust claims. It is a small metadata registry, not a payment contract.
+
+The contract is intentionally conservative. It does not let one account edit another account's record, and it does not treat an endpoint as trusted merely because it appears in the registry. Applications must still validate and monitor the service they connect to.
+
+## Stellar RPC gateway
+
+When `STELLAR_RPC_URL` is configured, the service exposes:
 
 ```text
-client
-  |
-  v
-HTTP router -> rate-limit middleware -> health / metrics / cache handlers
-                                      |                |
-                                      v                v
-                              operational counters   bounded JSON store
+GET /v1/stellar/ledger/latest
 ```
 
-The service is intentionally focused. It does not pretend to be a durable database, a malware detector, or a complete production API gateway. Those boundaries are documented so that future changes can add capability without hiding operational risk.
+The route sends a JSON-RPC `getLatestLedger` request to the configured Stellar RPC endpoint and returns the upstream result. It does not sign or submit transactions. This first integration keeps the trust boundary clear and gives the project a foundation for later read-only contract and event queries.
 
-## Endpoints
+The response path includes Tidegate's request rate limiting, tracing, and metrics. Upstream failures are returned as `502 Bad Gateway`; when no RPC URL is configured, the route returns `503 Service Unavailable` with a clear configuration error.
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/healthz` | Returns service status, current cache entries, and configured capacity. |
-| `GET` | `/metrics` | Returns request and cache operation counters as JSON. |
-| `GET` | `/v1/cache?key=name` | Reads a cached JSON value. Returns `404` if the key is absent and `400` if the key is invalid. |
-| `PUT` | `/v1/cache/:key` | Stores a JSON value and returns `201 Created`; invalid keys return `400`. |
-| `DELETE` | `/v1/cache/:key` | Removes a value and returns `204`, `404`, or `400` for an invalid key. |
+The gateway also exposes Stellar counters through `/metrics`:
 
-Cache keys must be non-empty, no more than 128 Unicode characters, and must not contain whitespace, control characters, or path separators. The cache uses a bounded recency queue. When it reaches capacity, the oldest untouched entry is removed. Updating an existing key refreshes its position. Cache values disappear when the process stops.
+```json
+{
+  "stellar_rpc_requests": 3,
+  "stellar_rpc_errors": 0
+}
+```
+
+The current RPC method is deliberately small. Future Stellar-specific work should add contract reads, event queries, and optional caching only with tests that define freshness and failure behavior.
 
 ## Quick start
 
-Install Rust 1.74 or newer, then run:
+Install Rust 1.74 or newer. To run the HTTP gateway locally:
 
 ```bash
 git clone https://github.com/Grace-CODE-D/tidegate.git
 cd tidegate
-cargo run
+STELLAR_RPC_URL=https://soroban-testnet.stellar.org cargo run
 ```
 
-The default listener is `127.0.0.1:8080`. In another terminal:
+The default listener is `127.0.0.1:8080`. Test the gateway:
 
 ```bash
 curl -sS http://127.0.0.1:8080/healthz
-# {"status":"ok","cached_entries":0,"cache_capacity":256}
-
-curl -sS -X PUT http://127.0.0.1:8080/v1/cache/greeting \
-  -H 'content-type: application/json' \
-  -d '{"value":{"message":"hello","source":"demo"}}'
-
-curl -sS 'http://127.0.0.1:8080/v1/cache?key=greeting'
-# {"value":{"message":"hello","source":"demo"}}
-
+curl -sS http://127.0.0.1:8080/v1/stellar/ledger/latest
 curl -sS http://127.0.0.1:8080/metrics
-# {"total_requests":4,"rejected_requests":0,"cache_reads":1,"cache_writes":1,"cache_deletes":0}
 ```
+
+Use a provider appropriate for your environment. Testnet and Futurenet are intended for development. Do not put credentials, signing keys, or provider tokens in source control. If a provider requires an authorization header in the future, it should be injected through a secret-management system rather than committed to the repository.
+
+## Build and test the contract
+
+The repository is a Cargo workspace. The contract can be tested without a live network:
+
+```bash
+cargo test -p gateway-registry
+cargo build -p gateway-registry --target wasm32-unknown-unknown --release
+```
+
+The recommended Stellar workflow uses the Stellar CLI for contract builds and deployment. After installing the CLI, the optimized contract build can be produced with:
+
+```bash
+stellar contract build
+```
+
+Deployment and invocation should initially target Testnet or Futurenet. The repository does not include a private key, deployer identity, or automatic Mainnet deployment. Operators should review the contract, configure their own identity, and follow the official Stellar deployment documentation before sending any transaction.
+
+## HTTP API
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/healthz` | Returns service status, cache usage, and configured capacity. |
+| `GET` | `/metrics` | Returns request, cache, and Stellar RPC counters as JSON. |
+| `GET` | `/v1/stellar/ledger/latest` | Proxies the read-only `getLatestLedger` Stellar RPC method. |
+| `GET` | `/v1/cache?key=name` | Reads a cached JSON value. |
+| `PUT` | `/v1/cache/:key` | Stores a JSON value in the bounded local cache. |
+| `DELETE` | `/v1/cache/:key` | Removes a cached value. |
+
+Cache keys must be non-empty, no more than 128 Unicode characters, and must not contain whitespace, control characters, or path separators. The cache is process-local and ephemeral. It uses a bounded recency queue so the oldest untouched entry is evicted when capacity is reached. It is not a substitute for on-chain state or durable application storage.
 
 ## Configuration
 
-Tidegate reads configuration from environment variables. Invalid numeric values fall back to safe defaults.
-
 | Variable | Default | Description |
 | --- | ---: | --- |
-| `TIDEGATE_ADDR` | `127.0.0.1:8080` | Bind address and port. |
+| `TIDEGATE_ADDR` | `127.0.0.1:8080` | HTTP bind address and port. |
+| `STELLAR_RPC_URL` | unset | Stellar RPC JSON-RPC endpoint. The Stellar route is unavailable when unset. |
 | `TIDEGATE_RATE_LIMIT` | `60` | Requests permitted per client window. |
 | `TIDEGATE_RATE_WINDOW_SECONDS` | `60` | Length of each rate-limit window. |
-| `TIDEGATE_CACHE_CAPACITY` | `256` | Maximum number of cached entries. Values below `1` use the default. |
-| `RUST_LOG` | `tidegate=info` | `tracing` filter, such as `tidegate=debug`. |
+| `TIDEGATE_CACHE_CAPACITY` | `256` | Maximum number of local cache entries. |
+| `RUST_LOG` | `tidegate=info` | Tracing filter, such as `tidegate=debug`. |
 
-For a local stress test with a small cache:
-
-```bash
-TIDEGATE_ADDR=127.0.0.1:9000 \
-TIDEGATE_CACHE_CAPACITY=10 \
-TIDEGATE_RATE_LIMIT=120 \
-RUST_LOG=tidegate=debug \
-cargo run
-```
-
-The rate limiter uses the first address in `X-Forwarded-For` when present and otherwise groups requests into a local bucket. Only enable that header behind a proxy that overwrites it; do not trust arbitrary client-supplied forwarding headers on a public listener.
+The rate limiter uses the first address in `X-Forwarded-For` when present. Only trust that header behind a proxy that overwrites it; do not trust arbitrary client-supplied forwarding headers on a public listener.
 
 ## Project structure
 
-The current MVP keeps the implementation deliberately small:
-
-- `src/main.rs` contains the Axum router, middleware, handlers, bounded cache, metrics, and tests.
-- `src/validation.rs` contains reusable cache-key validation rules and focused unit tests.
-- `.github/workflows/ci.yml` runs formatting, tests, and Clippy.
+- `contracts/gateway-registry/src/lib.rs` contains the Soroban contract and contract tests.
+- `src/main.rs` contains the Axum HTTP service, cache, middleware, routes, and service tests.
+- `src/stellar.rs` contains the read-only Stellar JSON-RPC client.
+- `src/validation.rs` contains cache-key validation rules.
+- `.github/workflows/ci.yml` runs formatting, workspace tests, and Clippy.
 - `.github/workflows/security.yml` runs RustSec dependency auditing and the blocked-CDN asset scan.
-- `scripts/security-scan.sh` rejects tracked runtime/configuration files that reference `polyfill.io` or `cdn.polyfill.io`.
-- `ROADMAP.md` describes the next pieces of work without claiming that they are already implemented.
+- `ROADMAP.md` lists the next Stellar and service improvements.
 
-## Development
+## Development checks
 
-Use the same checks locally that run in CI:
+Run the same checks locally that CI runs:
 
 ```bash
 cargo fmt --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ./scripts/security-scan.sh
-cargo audit
+cargo audit --ignore RUSTSEC-2026-0387
 ```
 
-The test suite covers cache round trips, bounded eviction, refresh behavior, configuration defaults, and an end-to-end router flow for writing, reading, and measuring a value. No external service is required for tests.
+The test suite covers registry registration and authorization flow under mocked Soroban environments, contract validation, cache eviction, cache-key validation, HTTP routes, metrics, and Stellar RPC client configuration. No live network or private key is required for tests.
 
-## Security posture and limits
+## Security boundaries
 
-The repository has targeted supply-chain controls rather than a claim of universal malware detection. RustSec audits the locked Rust dependency graph. The asset guard prevents the known Polyfill.io CDN indicators from being introduced into tracked runtime or configuration files. Pull requests should still be reviewed, dependencies should be updated, and production deployments should use host-level monitoring, least privilege, network controls, and secret management.
+Tidegate does not detect all malware and does not make a Stellar endpoint trustworthy merely because it is listed in a contract. The project uses RustSec auditing, a targeted Polyfill.io supply-chain guard, input validation, bounded local state, and explicit no-key-custody boundaries. Production deployments still need dependency review, secret management, host protection, TLS, proxy configuration, monitoring, and operational review.
 
-See [SECURITY.md](SECURITY.md) for reporting guidance and [CONTRIBUTING.md](CONTRIBUTING.md) for the review workflow.
-
-## Roadmap
-
-The next planned improvements are a pluggable storage trait, broader HTTP integration coverage, and clearer deployment guidance. Each change should be proposed in an issue, include tests, explain trade-offs, and link its pull request with a closing keyword.
+See [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [ROADMAP.md](ROADMAP.md) for the project policies and planned work.
 
 ## License
 
